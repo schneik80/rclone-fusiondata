@@ -155,6 +155,29 @@ graph TD
 | Create folder | REST | `POST .../folders` |
 | Resolve folder DM IDs | REST | `GET .../topFolders` + `GET .../folders/.../contents` |
 
+## File Type Extension Mapping
+
+The backend appends Fusion-specific file extensions to item display names so users can
+identify file types in Finder and file managers. Detection uses two methods:
+
+```mermaid
+flowchart TD
+    A[Item from GraphQL] --> B{__typename known?}
+    B -->|DesignItem| C[".fusiondesign"]
+    B -->|ConfiguredDesignItem| D[".fusionconfig"]
+    B -->|DrawingItem| E[".fusiondrawing"]
+    B -->|DrawingTemplateItem| F[".drawingtemplate"]
+    B -->|BasicItem / unknown| G{Check mimeType}
+    G -->|application/vnd.autodesk.fusion360| C
+    G -->|application/vnd.autodesk.fusionconfig| D
+    G -->|application/vnd.autodesk.fusiondrawing| E
+    G -->|application/vnd.autodesk.fusiondrawingtemplate| F
+    G -->|Other| H["Keep original name"]
+    B -->|Folder| I["No extension (directory)"]
+```
+
+Extensions are purely additive and preserved on upload.
+
 ## Dual-ID System
 
 Fusion Data uses two ID systems that the backend must bridge:

@@ -75,8 +75,10 @@ sequenceDiagram
     Fs->>GQL: GetItems(hubID, folderID)
     GQL->>Fs: []NavItem (with size, modTime, mimeType)
 
+    Note over Fs: Apply Fusion extensions:<br/>DesignItem → .fusiondesign<br/>DrawingItem → .fusiondrawing<br/>etc. (by typename or MIME fallback)
+
     Fs->>Cache: replaceChildren(folderID, items)
-    Fs->>VFS: []DirEntries (dirs + objects)
+    Fs->>VFS: []DirEntries (dirs + objects with extensions)
 ```
 
 ## Download File (Open)

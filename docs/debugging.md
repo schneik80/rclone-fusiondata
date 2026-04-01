@@ -200,6 +200,21 @@ ERROR: upload failed (HTTP 403): {"reason":"Legacy endpoint is deprecated"}
 
 **Fix:** Rebuild with the latest source. The current version uses signed S3 URLs for all uploads and downloads.
 
+### File Type Extension Not Applied
+
+**Cause:** The item's `__typename` is generic (`BasicItem`) and the MIME type doesn't match a known Fusion type.
+
+**Fix:** Run with `-vv` to see what typename and mimeType the API returns:
+```bash
+rclone ls Fusion-ADSK:Project/Folder/ -vv 2>&1 | grep -E "(GetItemDetails|navItemFromTypename)"
+```
+
+The backend maps extensions via two methods:
+1. `__typename`: `DesignItem` -> `.fusiondesign`, `DrawingItem` -> `.fusiondrawing`, etc.
+2. MIME type fallback: `application/vnd.autodesk.fusiondrawingtemplate` -> `.drawingtemplate`, etc.
+
+If your item type isn't covered, it will keep its original filename unchanged.
+
 ### Permission Denied
 
 ```

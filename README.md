@@ -17,6 +17,7 @@ Browse, download, upload, and sync Fusion Data projects, folders, and files usin
 - **Server-side change detection** via `--poll-interval` (ChangeNotify interface)
 - **Configurable cache TTL** aligned with rclone's `--dir-cache-time`
 - **Comprehensive logging** at Debug/Info/Notice/Error levels
+- **Fusion file type extensions** — DesignItem, DrawingItem, etc. display with custom extensions (`.fusiondesign`, `.fusiondrawing`, etc.)
 
 ## Prerequisites
 
@@ -94,6 +95,32 @@ make build
 | `--fusiondata-cache-ttl` | `5m` | Internal path cache TTL (align with `--dir-cache-time`) |
 | `--fusiondata-rate-limit` | `5` | Max API requests per second |
 | `--fusiondata-upload-chunk-size` | `100Mi` | Chunk size for multipart uploads |
+
+## File Type Extensions
+
+Fusion Data items are displayed with custom file extensions based on their type. This makes it easy to identify Fusion-specific files in Finder and file managers.
+
+| Fusion Type | Extension | Detection |
+|---|---|---|
+| DesignItem | `.fusiondesign` | `__typename` or MIME `application/vnd.autodesk.fusion360` |
+| ConfiguredDesignItem | `.fusionconfig` | `__typename` or MIME `application/vnd.autodesk.fusionconfig` |
+| DrawingItem | `.fusiondrawing` | `__typename` or MIME `application/vnd.autodesk.fusiondrawing` |
+| DrawingTemplateItem | `.drawingtemplate` | `__typename` or MIME `application/vnd.autodesk.fusiondrawingtemplate` |
+| BasicItem (PDF, PNG, etc.) | *(unchanged)* | Original extension preserved |
+| Folder | *(none)* | Displayed as directory |
+
+**Examples:**
+```
+MyProject/
+  Designs/
+    Engine Block.fusiondesign          (DesignItem)
+    Assembly Drawing.fusiondrawing     (DrawingItem)
+    My Template.drawingtemplate        (DrawingTemplateItem)
+    reference.pdf                      (BasicItem — unchanged)
+    photo.png                          (BasicItem — unchanged)
+```
+
+Extensions are preserved on upload — if you save `Part.fusiondesign`, that full name is sent to the API.
 
 ## Debugging
 
