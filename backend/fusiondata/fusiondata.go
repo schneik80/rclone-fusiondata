@@ -863,9 +863,135 @@ func parseSizeString(s string) int64 {
 	return size
 }
 
+// ChangeNotify polls for server-side changes and calls the notify function
+// with paths that have changed. This enables --poll-interval support.
+//
+// The implementation snapshots directory listings and compares them on each
+// poll cycle. When items are added, removed, or modified, the parent directory
+// path is reported as changed.
+func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryType), pollIntervalChan <-chan time.Duration) {
+	go func() {
+		var ticker *time.Ticker
+		var tickerC <-chan time.Time
+		snapshots := make(map[string]dirSnapshot)
+
+		for {
+			select {
+			case <-ctx.Done():
+				if ticker != nil {
+					ticker.Stop()
+				}
+				return
+
+			case interval, ok := <-pollIntervalChan:
+				if !ok {
+					// Channel closed — stop polling.
+					if ticker != nil {
+						ticker.Stop()
+					}
+					return
+				}
+				if ticker != nil {
+					ticker.Stop()
+					tickerC = nil
+				}
+				if interval == 0 {
+					// Pause polling.
+					continue
+				}
+				ticker = time.NewTicker(interval)
+				tickerC = ticker.C
+
+			case <-tickerC:
+				f.pollForChanges(ctx, notifyFunc, snapshots)
+			}
+		}
+	}()
+}
+
+// dirSnapshot stores the last known state of a directory for change detection.
+type dirSnapshot struct {
+	entries map[string]int64 // name -> size (items) or -1 (directories)
+}
+
+// pollForChanges checks all cached directories for changes.
+func (f *Fs) pollForChanges(ctx context.Context, notifyFunc func(string, fs.EntryType), snapshots map[string]dirSnapshot) {
+	// Poll the hub root (projects).
+	f.pollDir(ctx, "", notifyFunc, snapshots)
+
+	// Poll each known project's top-level contents.
+	projects, err := GetProjects(ctx, f.srv, f.hubID)
+	if err != nil {
+		fs.Debugf(f, "ChangeNotify: error listing projects: %v", err)
+		return
+	}
+
+	for _, p := range projects {
+		projDir := trimRoot(f.root, p.Name)
+		f.pollDir(ctx, projDir, notifyFunc, snapshots)
+	}
+}
+
+// pollDir lists a single directory and compares against the snapshot.
+// If changes are detected, notifyFunc is called for the changed entries.
+func (f *Fs) pollDir(ctx context.Context, dir string, notifyFunc func(string, fs.EntryType), snapshots map[string]dirSnapshot) {
+	entries, err := f.List(ctx, dir)
+	if err != nil {
+		return
+	}
+
+	// Build current state.
+	current := make(map[string]int64, len(entries))
+	for _, entry := range entries {
+		switch e := entry.(type) {
+		case fs.Directory:
+			current[e.Remote()] = -1
+		case fs.Object:
+			current[e.Remote()] = e.Size()
+		}
+	}
+
+	// Compare with previous snapshot.
+	prev, hasPrev := snapshots[dir]
+	if hasPrev {
+		changed := false
+		// Check for new or modified entries.
+		for name, size := range current {
+			oldSize, existed := prev.entries[name]
+			if !existed || oldSize != size {
+				changed = true
+				if size == -1 {
+					notifyFunc(name, fs.EntryDirectory)
+				} else {
+					notifyFunc(name, fs.EntryObject)
+				}
+			}
+		}
+		// Check for deleted entries.
+		for name, size := range prev.entries {
+			if _, exists := current[name]; !exists {
+				changed = true
+				if size == -1 {
+					notifyFunc(name, fs.EntryDirectory)
+				} else {
+					notifyFunc(name, fs.EntryObject)
+				}
+			}
+		}
+		if changed {
+			// Also notify the parent directory itself.
+			notifyFunc(dir, fs.EntryDirectory)
+		}
+	}
+
+	// Update snapshot.
+	snapshots[dir] = dirSnapshot{entries: current}
+}
+
 // Check interfaces are satisfied.
 var (
-	_ fs.Fs       = (*Fs)(nil)
-	_ fs.Mover    = (*Fs)(nil)
-	_ fs.DirMover = (*Fs)(nil)
+	_ fs.Fs             = (*Fs)(nil)
+	_ fs.Mover          = (*Fs)(nil)
+	_ fs.DirMover       = (*Fs)(nil)
+	_ fs.ChangeNotifier = (*Fs)(nil)
 )
