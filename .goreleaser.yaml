@@ -1,0 +1,78 @@
+version: 2
+
+project_name: rclone-fusiondata
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: rclone-fusiondata
+    binary: rclone
+    main: .
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+universal_binaries:
+  - id: rclone-fusiondata
+    replace: true
+    name_template: rclone
+
+archives:
+  - id: default
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    formats:
+      - tar.gz
+    files:
+      - README.md
+      - LICENSE
+      - docs/*
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^Merge"
+
+release:
+  github:
+    owner: schneik80
+    name: rclone-fusiondata
+  header: |
+    ## rclone-fusiondata {{ .Version }}
+
+    Custom rclone binary with the Autodesk Fusion Data (APS) backend.
+
+    ### Installation
+
+    Download the archive for your platform, extract it, and place `rclone` in your PATH.
+
+    **macOS (Apple Silicon):** `rclone-fusiondata_{{ .Version }}_darwin_all.tar.gz`
+    **macOS (Intel):** Same universal binary as above
+    **Linux (x86_64):** `rclone-fusiondata_{{ .Version }}_linux_amd64.tar.gz`
+    **Linux (ARM64):** `rclone-fusiondata_{{ .Version }}_linux_arm64.tar.gz`
+    **Windows (x86_64):** `rclone-fusiondata_{{ .Version }}_windows_amd64.zip`
+    **Windows (ARM64):** `rclone-fusiondata_{{ .Version }}_windows_arm64.zip`
+
+    > **Note:** These builds do not include `rclone mount` (requires platform-specific FUSE libraries).
+    > Use `rclone nfsmount` instead, or build from source with `make build` for FUSE mount support.
+  footer: |
+    **Full Changelog**: https://github.com/schneik80/rclone-fusiondata/compare/{{ .PreviousTag }}...{{ .Tag }}
