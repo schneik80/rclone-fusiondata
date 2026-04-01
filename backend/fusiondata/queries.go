@@ -384,7 +384,7 @@ func GetProjectItems(ctx context.Context, client *http.Client, projectID string)
 
 	items := make([]NavItem, len(all))
 	for i, it := range all {
-		items[i] = navItemFromTypename(it.ID, it.Name, it.Typename)
+		items[i] = navItemFromTypename(it.ID, it.Name, it.Typename, it.MimeType)
 		items[i].Size = parseSizeStr(it.Size)
 		items[i].ModTime = parseTime(it.ModifiedOn)
 		items[i].MimeType = it.MimeType
@@ -458,7 +458,7 @@ func GetItems(ctx context.Context, client *http.Client, hubID, folderID string) 
 
 	items := make([]NavItem, len(all))
 	for i, it := range all {
-		items[i] = navItemFromTypename(it.ID, it.Name, it.Typename)
+		items[i] = navItemFromTypename(it.ID, it.Name, it.Typename, it.MimeType)
 		items[i].Size = parseSizeStr(it.Size)
 		items[i].ModTime = parseTime(it.ModifiedOn)
 		items[i].MimeType = it.MimeType
@@ -568,23 +568,53 @@ func GetItemDetails(ctx context.Context, client *http.Client, hubID, itemID stri
 // Helpers
 // ---------------------------------------------------------------------------
 
-// fusionExtensions maps GraphQL typenames to Fusion-specific file extensions.
-var fusionExtensions = map[string]string{
-	"DesignItem":             ".fusiondesign",
-	"ConfiguredDesignItem":   ".fusionconfig",
-	"DrawingItem":            ".fusiondrawing",
-	"DrawingTemplateItem":    ".drawingtemplate",
+// fusionExtByTypename maps GraphQL __typename to file extensions.
+var fusionExtByTypename = map[string]string{
+	"DesignItem":           ".fusiondesign",
+	"ConfiguredDesignItem": ".fusionconfig",
+	"DrawingItem":          ".fusiondrawing",
+	"DrawingTemplateItem":  ".drawingtemplate",
+}
+
+// fusionExtByMimeType maps MIME types to file extensions.
+// Used as fallback when __typename is generic (e.g. BasicItem).
+var fusionExtByMimeType = map[string]string{
+	"application/vnd.autodesk.fusiondrawingtemplate": ".drawingtemplate",
+	"application/vnd.autodesk.fusion360":             ".fusiondesign",
+	"application/vnd.autodesk.fusionconfig":          ".fusionconfig",
+	"application/vnd.autodesk.fusiondrawing":         ".fusiondrawing",
+}
+
+// allFusionExtensions is the combined set of all fusion extensions for stripping.
+var allFusionExtensions = []string{
+	".fusiondesign",
+	".fusionconfig",
+	".fusiondrawing",
+	".drawingtemplate",
 }
 
 // applyFusionExtension appends the appropriate Fusion extension to a filename
-// if the item is a Fusion type and doesn't already have the extension.
+// based on the typename first, then mimeType as fallback.
 func applyFusionExtension(name, typename string) string {
-	ext, ok := fusionExtensions[typename]
+	ext, ok := fusionExtByTypename[typename]
 	if !ok {
-		return name // not a Fusion type — leave as-is
+		return name // not a known Fusion type — leave as-is
 	}
 	if strings.HasSuffix(strings.ToLower(name), ext) {
 		return name // already has the extension
+	}
+	return name + ext
+}
+
+// applyFusionExtensionByMime appends a Fusion extension based on MIME type.
+// Used when the typename is generic (e.g. BasicItem) but the MIME type is Fusion-specific.
+func applyFusionExtensionByMime(name, mimeType string) string {
+	ext, ok := fusionExtByMimeType[mimeType]
+	if !ok {
+		return name
+	}
+	if strings.HasSuffix(strings.ToLower(name), ext) {
+		return name
 	}
 	return name + ext
 }
@@ -593,7 +623,7 @@ func applyFusionExtension(name, typename string) string {
 // Used when matching display names back to server-side names.
 func stripFusionExtension(name string) string {
 	lower := strings.ToLower(name)
-	for _, ext := range fusionExtensions {
+	for _, ext := range allFusionExtensions {
 		if strings.HasSuffix(lower, ext) {
 			return name[:len(name)-len(ext)]
 		}
@@ -601,7 +631,7 @@ func stripFusionExtension(name string) string {
 	return name
 }
 
-func navItemFromTypename(id, name, typename string) NavItem {
+func navItemFromTypename(id, name, typename, mimeType string) NavItem {
 	kind := "unknown"
 	isContainer := false
 	switch typename {
@@ -620,8 +650,29 @@ func navItemFromTypename(id, name, typename string) NavItem {
 		kind = "basic"
 	}
 	// Apply Fusion file extension for non-container items.
+	// Try typename first, then fall back to MIME type.
 	if !isContainer {
-		name = applyFusionExtension(name, typename)
+		extended := applyFusionExtension(name, typename)
+		if extended == name && mimeType != "" {
+			// Typename didn't match — try MIME type (e.g. drawing templates).
+			extended = applyFusionExtensionByMime(name, mimeType)
+			// Also update kind if MIME matched.
+			if extended != name {
+				if _, ok := fusionExtByMimeType[mimeType]; ok {
+					switch mimeType {
+					case "application/vnd.autodesk.fusiondrawingtemplate":
+						kind = "drawingtemplate"
+					case "application/vnd.autodesk.fusion360":
+						kind = "design"
+					case "application/vnd.autodesk.fusionconfig":
+						kind = "configured"
+					case "application/vnd.autodesk.fusiondrawing":
+						kind = "drawing"
+					}
+				}
+			}
+		}
+		name = extended
 	}
 	return NavItem{ID: id, Name: name, Kind: kind, IsContainer: isContainer}
 }
