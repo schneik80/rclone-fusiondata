@@ -23,6 +23,7 @@ type Object struct {
 	size     int64
 	modTime  time.Time
 	mimeType string
+	etag     string // ETag from S3 download response
 }
 
 // Fs returns the parent Fs.
@@ -65,11 +66,6 @@ func (o *Object) MimeType(ctx context.Context) string {
 
 // Open opens the object for reading. It downloads the file via a signed S3 URL.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	token, err := o.fs.getToken()
-	if err != nil {
-		return nil, err
-	}
-
 	// Resolve the full path to get project context.
 	fullPath := o.fs.root
 	if o.remote != "" {
@@ -87,28 +83,29 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return nil, errors.New("cannot determine project for download")
 	}
 
-	// Resolve folder and item DM IDs via the REST API.
+	// Resolve folder and item DM IDs via the REST API (uses f.doAPIRequest internally).
 	dir := fullPath
 	if idx := strings.LastIndex(dir, "/"); idx >= 0 {
 		dir = dir[:idx]
 	} else {
 		dir = ""
 	}
-	folderDM, err := o.fs.resolveFolderDMForPath(ctx, token, dir)
+	folderDM, err := o.fs.resolveFolderDMForPath(ctx, dir)
 	if err != nil {
 		return nil, fmt.Errorf("resolving folder DM for download: %w", err)
 	}
 
-	itemDM, err := o.fs.resolveItemDM(ctx, token, resolved.projectDM, folderDM, o.name)
+	itemDM, err := o.fs.resolveItemDM(ctx, resolved.projectDM, folderDM, o.name)
 	if err != nil {
 		return nil, fmt.Errorf("resolving item DM for download: %w", err)
 	}
 
-	downloadURL, err := o.fs.getDownloadURLWithProject(ctx, token, resolved.projectDM, itemDM)
+	downloadURL, err := o.fs.getDownloadURLWithProject(ctx, resolved.projectDM, itemDM)
 	if err != nil {
 		return nil, fmt.Errorf("getting download URL: %w", err)
 	}
 
+	// The S3 download URL is pre-signed, so use http.DefaultClient (no auth needed).
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return nil, err
@@ -135,16 +132,16 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return nil, fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
 	}
 
+	// Capture ETag from S3 response.
+	if etag := resp.Header.Get("ETag"); etag != "" {
+		o.etag = etag
+	}
+
 	return resp.Body, nil
 }
 
 // Update replaces the content of this object (creates a new version in Fusion Data).
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	token, err := o.fs.getToken()
-	if err != nil {
-		return err
-	}
-
 	// Resolve path to get project DM ID and item DM ID.
 	fullPath := o.fs.root
 	if o.remote != "" {
@@ -170,29 +167,29 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	} else {
 		dir = ""
 	}
-	folderDM, err := o.fs.resolveFolderDMForPath(ctx, token, dir)
+	folderDM, err := o.fs.resolveFolderDMForPath(ctx, dir)
 	if err != nil {
 		return fmt.Errorf("resolving folder DM ID for update: %w", err)
 	}
 
 	// Resolve item DM ID via the REST API.
-	itemDM, err := o.fs.resolveItemDM(ctx, token, resolved.projectDM, folderDM, o.name)
+	itemDM, err := o.fs.resolveItemDM(ctx, resolved.projectDM, folderDM, o.name)
 	if err != nil {
 		return fmt.Errorf("resolving item DM ID for update: %w", err)
 	}
 
 	// Create new storage and upload.
-	storageID, err := o.fs.createStorage(ctx, token, resolved.projectDM, folderDM, o.name)
+	storageID, err := o.fs.createStorage(ctx, resolved.projectDM, folderDM, o.name)
 	if err != nil {
 		return fmt.Errorf("creating storage for update: %w", err)
 	}
 
-	if err := o.fs.uploadToStorage(ctx, token, storageID, in, src.Size()); err != nil {
+	if err := o.fs.uploadToStorage(ctx, storageID, in, src.Size()); err != nil {
 		return fmt.Errorf("uploading update: %w", err)
 	}
 
 	// Create new version of the existing item.
-	if err := o.fs.createNextVersion(ctx, token, resolved.projectDM, itemDM, o.name, storageID); err != nil {
+	if err := o.fs.createNextVersion(ctx, resolved.projectDM, itemDM, o.name, storageID); err != nil {
 		return fmt.Errorf("creating new version: %w", err)
 	}
 
@@ -216,6 +213,6 @@ func (o *Object) Remove(ctx context.Context) error {
 
 // Check interface satisfaction.
 var (
-	_ fs.Object   = (*Object)(nil)
+	_ fs.Object    = (*Object)(nil)
 	_ fs.MimeTyper = (*Object)(nil)
 )

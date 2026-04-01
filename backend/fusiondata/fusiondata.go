@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -52,11 +53,14 @@ var oauthConfig = &oauth2.Config{
 
 // Options defines the configuration for the Fusion Data backend.
 type Options struct {
-	ClientID     string `config:"client_id"`
-	ClientSecret string `config:"client_secret"`
-	HubID        string `config:"hub_id"`
-	HubName      string `config:"hub_name"`
-	Region       string `config:"region"`
+	ClientID        string        `config:"client_id"`
+	ClientSecret    string        `config:"client_secret"`
+	HubID           string        `config:"hub_id"`
+	HubName         string        `config:"hub_name"`
+	Region          string        `config:"region"`
+	CacheTTL        fs.Duration   `config:"cache_ttl"`
+	RateLimit       int           `config:"rate_limit"`
+	UploadChunkSize fs.SizeSuffix `config:"upload_chunk_size"`
 }
 
 func init() {
@@ -99,6 +103,24 @@ func init() {
 					{Value: "AUS", Help: "Australia"},
 				},
 			},
+			{
+				Name:     "cache_ttl",
+				Help:     "TTL for internal path cache entries.",
+				Default:  fs.Duration(5 * time.Minute),
+				Advanced: true,
+			},
+			{
+				Name:     "rate_limit",
+				Help:     "Maximum API requests per second.",
+				Default:  5,
+				Advanced: true,
+			},
+			{
+				Name:     "upload_chunk_size",
+				Help:     "Chunk size for multipart uploads.",
+				Default:  fs.SizeSuffix(100 * 1024 * 1024),
+				Advanced: true,
+			},
 		},
 	}
 	fs.Register(fsi)
@@ -135,6 +157,7 @@ func configHandler(ctx context.Context, name string, m configmap.Mapper, config 
 
 	case "oauth_done":
 		// Step 2: List hubs and let user choose.
+		// Uses token-based query since there is no Fs struct yet.
 		clientID, _ := m.Get("client_id")
 		region, _ := m.Get("region")
 		tokenJSON, _ := m.Get("token")
@@ -150,7 +173,7 @@ func configHandler(ctx context.Context, name string, m configmap.Mapper, config 
 		_ = clientID // available if needed
 		SetRegion(region)
 
-		hubs, err := GetHubs(ctx, token.AccessToken)
+		hubs, err := GetHubsWithToken(ctx, token.AccessToken)
 		if err != nil {
 			return nil, fmt.Errorf("listing hubs: %w", err)
 		}
@@ -183,7 +206,7 @@ func configHandler(ctx context.Context, name string, m configmap.Mapper, config 
 		var token oauth2.Token
 		if err := json.Unmarshal([]byte(tokenJSON), &token); err == nil {
 			SetRegion(region)
-			if hubs, err := GetHubs(ctx, token.AccessToken); err == nil {
+			if hubs, err := GetHubsWithToken(ctx, token.AccessToken); err == nil {
 				for _, h := range hubs {
 					if h.ID == hubID {
 						m.Set("hub_name", h.Name)
@@ -197,6 +220,30 @@ func configHandler(ctx context.Context, name string, m configmap.Mapper, config 
 	}
 
 	return nil, fmt.Errorf("unknown config state: %q", config.State)
+}
+
+// persistingTokenSource wraps an oauth2.TokenSource and persists refreshed
+// tokens back to the rclone config via configmap.Mapper.
+type persistingTokenSource struct {
+	base      oauth2.TokenSource
+	m         configmap.Mapper
+	lastToken string // last known access token to detect changes
+	mu        sync.Mutex
+}
+
+func (p *persistingTokenSource) Token() (*oauth2.Token, error) {
+	tok, err := p.base.Token()
+	if err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if tok.AccessToken != p.lastToken {
+		p.lastToken = tok.AccessToken
+		tokenJSON, _ := json.Marshal(tok)
+		p.m.Set("token", string(tokenJSON))
+	}
+	return tok, nil
 }
 
 // doOAuthLogin performs the full PKCE OAuth2 flow: opens browser, waits for
@@ -365,6 +412,7 @@ type Fs struct {
 	features *fs.Features
 	srv      *http.Client
 	ts       oauth2.TokenSource
+	m        configmap.Mapper
 	hubID    string
 	hubDM    string // Data Management API hub ID
 	region   string
@@ -382,6 +430,13 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, errors.New("hub_id not set — run rclone config to select a hub")
 	}
 
+	// Initialize the API throttle from configured rate limit.
+	rateLimit := opt.RateLimit
+	if rateLimit <= 0 {
+		rateLimit = 5
+	}
+	initThrottle(rateLimit)
+
 	// Set up OAuth2 token source for automatic refresh.
 	oauthCfg := *oauthConfig
 	oauthCfg.ClientID = opt.ClientID
@@ -396,8 +451,19 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, fmt.Errorf("invalid OAuth token: %w", err)
 	}
 
-	ts := oauthCfg.TokenSource(ctx, &token)
+	baseTS := oauthCfg.TokenSource(ctx, &token)
+	ts := &persistingTokenSource{
+		base:      baseTS,
+		m:         m,
+		lastToken: token.AccessToken,
+	}
 	client := oauth2.NewClient(ctx, ts)
+
+	// Determine cache TTL from options.
+	cacheTTL := time.Duration(opt.CacheTTL)
+	if cacheTTL <= 0 {
+		cacheTTL = 5 * time.Minute
+	}
 
 	f := &Fs{
 		name:   name,
@@ -405,23 +471,21 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt:    *opt,
 		srv:    client,
 		ts:     ts,
+		m:      m,
 		hubID:  opt.HubID,
 		region: opt.Region,
-		cache:  newPathCache(5 * time.Minute),
+		cache:  newPathCache(cacheTTL),
 	}
 
 	SetRegion(opt.Region)
 
-	// Resolve hub DM ID for REST API write operations.
-	tok, err := ts.Token()
+	// Resolve hub DM ID for REST API write operations using the oauth2 client.
+	hubs, err := GetHubs(ctx, f.srv)
 	if err == nil {
-		hubs, err := GetHubs(ctx, tok.AccessToken)
-		if err == nil {
-			for _, h := range hubs {
-				if h.ID == opt.HubID {
-					f.hubDM = h.AltID
-					break
-				}
+		for _, h := range hubs {
+			if h.ID == opt.HubID {
+				f.hubDM = h.AltID
+				break
 			}
 		}
 	}
@@ -488,17 +552,12 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 		return nil, fs.ErrorDirNotFound
 	}
 
-	token, err := f.getToken()
-	if err != nil {
-		return nil, err
-	}
-
 	var entries fs.DirEntries
 
 	switch resolved.kind {
 	case "hub":
-		// List projects.
-		projects, err := GetProjects(ctx, token, f.hubID)
+		// List projects using the oauth2 HTTP client.
+		projects, err := GetProjects(ctx, f.srv, f.hubID)
 		if err != nil {
 			return nil, err
 		}
@@ -506,12 +565,13 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 			remote := trimRoot(f.root, p.Name)
 			d := fs.NewDir(remote, time.Time{})
 			entries = append(entries, d)
-			f.cache.putChild(f.hubID, p.Name, &p)
 		}
+		// Replace all children in cache atomically.
+		f.cache.replaceChildren(f.hubID, projects)
 
 	case "project":
 		// List top-level folders in the project.
-		folders, err := GetFolders(ctx, token, resolved.id)
+		folders, err := GetFolders(ctx, f.srv, resolved.id)
 		if err != nil {
 			return nil, err
 		}
@@ -519,10 +579,9 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 			remote := trimRoot(f.root, path.Join(dir, fld.Name))
 			d := fs.NewDir(remote, time.Time{})
 			entries = append(entries, d)
-			f.cache.putChild(resolved.id, fld.Name, &fld)
 		}
 		// Also list items at project root.
-		items, err := GetProjectItems(ctx, token, resolved.id)
+		items, err := GetProjectItems(ctx, f.srv, resolved.id)
 		if err != nil {
 			return nil, err
 		}
@@ -544,12 +603,14 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 				}
 				entries = append(entries, o)
 			}
-			f.cache.putChild(resolved.id, it.Name, &it)
 		}
+		// Replace all children in cache atomically.
+		allChildren := append(folders, items...)
+		f.cache.replaceChildren(resolved.id, allChildren)
 
 	case "folder":
 		// List contents of a folder.
-		items, err := GetItems(ctx, token, f.hubID, resolved.id)
+		items, err := GetItems(ctx, f.srv, f.hubID, resolved.id)
 		if err != nil {
 			return nil, err
 		}
@@ -571,8 +632,9 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 				}
 				entries = append(entries, o)
 			}
-			f.cache.putChild(resolved.id, it.Name, &it)
 		}
+		// Replace all children in cache atomically.
+		f.cache.replaceChildren(resolved.id, items)
 	}
 
 	return entries, nil
@@ -589,12 +651,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		return nil, fs.ErrorIsDir
 	}
 
-	token, err := f.getToken()
-	if err != nil {
-		return nil, err
-	}
-
-	details, err := GetItemDetails(ctx, token, f.hubID, resolved.id)
+	details, err := GetItemDetails(ctx, f.srv, f.hubID, resolved.id)
 	if err != nil {
 		return nil, err
 	}
@@ -635,29 +692,24 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		return nil, fmt.Errorf("resolving parent directory: %w", err)
 	}
 
-	token, err := f.getToken()
-	if err != nil {
-		return nil, err
-	}
-
 	projectDM := parentResolved.projectDM
 	if projectDM == "" {
 		return nil, errors.New("cannot determine project for upload")
 	}
 
 	// Resolve the folder DM ID via the REST API by walking the folder path.
-	folderDM, err := f.resolveFolderDMForPath(ctx, token, dir)
+	folderDM, err := f.resolveFolderDMForPath(ctx, dir)
 	if err != nil {
 		return nil, fmt.Errorf("resolving folder DM ID: %w", err)
 	}
 
 	// Upload content to storage.
-	storageID, err := f.createStorage(ctx, token, projectDM, folderDM, leaf)
+	storageID, err := f.createStorage(ctx, projectDM, folderDM, leaf)
 	if err != nil {
 		return nil, fmt.Errorf("creating storage: %w", err)
 	}
 
-	if err := f.uploadToStorage(ctx, token, storageID, in, src.Size()); err != nil {
+	if err := f.uploadToStorage(ctx, storageID, in, src.Size()); err != nil {
 		return nil, fmt.Errorf("uploading file: %w", err)
 	}
 
@@ -665,9 +717,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	existing, _ := f.resolvePath(ctx, fullPath)
 	if existing != nil && existing.kind != "hub" && existing.kind != "project" && existing.kind != "folder" {
 		// File exists — resolve its DM item ID and create new version.
-		itemDM, err := f.resolveItemDM(ctx, token, projectDM, folderDM, leaf)
+		itemDM, err := f.resolveItemDM(ctx, projectDM, folderDM, leaf)
 		if err == nil && itemDM != "" {
-			if err := f.createNextVersion(ctx, token, projectDM, itemDM, leaf, storageID); err != nil {
+			if err := f.createNextVersion(ctx, projectDM, itemDM, leaf, storageID); err != nil {
 				return nil, fmt.Errorf("creating new version: %w", err)
 			}
 			f.cache.invalidate(parentResolved.id)
@@ -684,7 +736,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	}
 
 	// New file — create first version.
-	itemID, err := f.createFirstVersion(ctx, token, projectDM, folderDM, leaf, storageID)
+	itemID, err := f.createFirstVersion(ctx, projectDM, folderDM, leaf, storageID)
 	if err != nil {
 		return nil, fmt.Errorf("creating item version: %w", err)
 	}
@@ -733,22 +785,17 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 		return fmt.Errorf("resolving parent: %w", err)
 	}
 
-	token, err := f.getToken()
-	if err != nil {
-		return err
-	}
-
 	if parent.projectDM == "" {
 		return errors.New("cannot create folder: no project context")
 	}
 
 	// Resolve the parent folder DM ID via the REST API.
-	parentFolderDM, err := f.resolveFolderDMForPath(ctx, token, parentPath)
+	parentFolderDM, err := f.resolveFolderDMForPath(ctx, parentPath)
 	if err != nil {
 		return fmt.Errorf("resolving parent folder DM ID: %w", err)
 	}
 
-	_, err = f.createFolder(ctx, token, parent.projectDM, parentFolderDM, leaf)
+	_, err = f.createFolder(ctx, parent.projectDM, parentFolderDM, leaf)
 	if err != nil {
 		return err
 	}
@@ -767,7 +814,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 
 // resolveFolderDMForPath resolves an rclone directory path to a DM API folder ID
 // by walking the folder tree via the REST Data Management API.
-func (f *Fs) resolveFolderDMForPath(ctx context.Context, token, dir string) (string, error) {
+func (f *Fs) resolveFolderDMForPath(ctx context.Context, dir string) (string, error) {
 	segments := splitPath(dir)
 	if len(segments) < 2 {
 		// At project level — find the project's root folder via DM API.
@@ -776,7 +823,7 @@ func (f *Fs) resolveFolderDMForPath(ctx context.Context, token, dir string) (str
 			return "", err
 		}
 		if resolved.kind == "project" {
-			topFolders, err := f.getTopFolders(ctx, token, f.hubDM, resolved.altID)
+			topFolders, err := f.getTopFolders(ctx, f.hubDM, resolved.altID)
 			if err != nil {
 				return "", err
 			}
@@ -797,7 +844,7 @@ func (f *Fs) resolveFolderDMForPath(ctx context.Context, token, dir string) (str
 	projectDM := projectResolved.altID
 	folderNames := segments[1:]
 
-	return f.resolveFolderDMPath(ctx, token, f.hubDM, projectDM, folderNames)
+	return f.resolveFolderDMPath(ctx, f.hubDM, projectDM, folderNames)
 }
 
 // trimRoot removes the root prefix from a path to produce a relative remote path.

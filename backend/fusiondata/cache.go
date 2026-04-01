@@ -58,6 +58,27 @@ func (c *pathCache) putChild(parentID, childName string, item *NavItem) {
 	}
 }
 
+// replaceChildren atomically removes all existing children of a parent
+// and replaces them with the given items.
+func (c *pathCache) replaceChildren(parentID string, items []NavItem) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Delete all existing children of this parent.
+	prefix := parentID + "/"
+	for key := range c.entries {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			delete(c.entries, key)
+		}
+	}
+
+	// Add all new children.
+	for i := range items {
+		key := cacheKey(parentID, items[i].Name)
+		c.entries[key] = cacheEntry{item: items[i], expires: time.Now().Add(c.ttl)}
+	}
+}
+
 // invalidate removes all cached children of a parent.
 func (c *pathCache) invalidate(parentID string) {
 	c.mu.Lock()

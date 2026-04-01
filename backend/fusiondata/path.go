@@ -52,13 +52,8 @@ func (f *Fs) resolvePath(ctx context.Context, p string) (*resolvedPath, error) {
 		}
 	}
 
-	token, err := f.getToken()
-	if err != nil {
-		return nil, err
-	}
-
 	// Segment 0: find project by name.
-	project, err := f.findChildByName(ctx, token, f.hubID, "hub", segments[0])
+	project, err := f.findChildByName(ctx, f.hubID, "hub", segments[0])
 	if err != nil {
 		return nil, fmt.Errorf("project %q not found: %w", segments[0], err)
 	}
@@ -81,7 +76,7 @@ func (f *Fs) resolvePath(ctx context.Context, p string) (*resolvedPath, error) {
 	projectDM := project.AltID
 
 	for i := 1; i < len(segments); i++ {
-		child, err := f.findChildByName(ctx, token, currentID, currentKind, segments[i])
+		child, err := f.findChildByName(ctx, currentID, currentKind, segments[i])
 		if err != nil {
 			return nil, fmt.Errorf("path segment %q not found in %s: %w", segments[i], strings.Join(segments[:i], "/"), err)
 		}
@@ -114,14 +109,14 @@ func (f *Fs) resolvePath(ctx context.Context, p string) (*resolvedPath, error) {
 
 // findChildByName searches for a child with the given name under a parent.
 // parentKind determines which API call to use.
-func (f *Fs) findChildByName(ctx context.Context, token, parentID, parentKind, name string) (*NavItem, error) {
+func (f *Fs) findChildByName(ctx context.Context, parentID, parentKind, name string) (*NavItem, error) {
 	// Check cache first.
 	if cached := f.cache.getChild(parentID, name); cached != nil {
 		return cached, nil
 	}
 
 	// Fetch children and populate cache.
-	children, err := f.listChildren(ctx, token, parentID, parentKind)
+	children, err := f.listChildren(ctx, parentID, parentKind)
 	if err != nil {
 		return nil, err
 	}
@@ -137,23 +132,24 @@ func (f *Fs) findChildByName(ctx context.Context, token, parentID, parentKind, n
 }
 
 // listChildren returns all children of a parent node.
-func (f *Fs) listChildren(ctx context.Context, token, parentID, parentKind string) ([]NavItem, error) {
+// Uses f.srv (oauth2 HTTP client) for GraphQL queries.
+func (f *Fs) listChildren(ctx context.Context, parentID, parentKind string) ([]NavItem, error) {
 	switch parentKind {
 	case "hub":
-		return GetProjects(ctx, token, f.hubID)
+		return GetProjects(ctx, f.srv, f.hubID)
 	case "project":
 		// A project can contain both top-level folders and root items.
-		folders, err := GetFolders(ctx, token, parentID)
+		folders, err := GetFolders(ctx, f.srv, parentID)
 		if err != nil {
 			return nil, err
 		}
-		items, err := GetProjectItems(ctx, token, parentID)
+		items, err := GetProjectItems(ctx, f.srv, parentID)
 		if err != nil {
 			return nil, err
 		}
 		return append(folders, items...), nil
 	case "folder":
-		return GetItems(ctx, token, f.hubID, parentID)
+		return GetItems(ctx, f.srv, f.hubID, parentID)
 	default:
 		return nil, fmt.Errorf("cannot list children of %s", parentKind)
 	}

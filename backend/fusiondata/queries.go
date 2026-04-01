@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -13,7 +14,8 @@ import (
 // ---------------------------------------------------------------------------
 
 // GetHubs returns all hubs accessible to the authenticated user.
-func GetHubs(ctx context.Context, token string) ([]NavItem, error) {
+// Uses the provided HTTP client (oauth2 auto-injects tokens).
+func GetHubs(ctx context.Context, client *http.Client) ([]NavItem, error) {
 	const qFirst = `
 		query GetHubs {
 			hubs(pagination: { limit: 50 }) {
@@ -44,7 +46,79 @@ func GetHubs(ctx context.Context, token string) ([]NavItem, error) {
 		} `json:"alternativeIdentifiers"`
 	}
 
-	pages, err := allPages(ctx, token, qFirst, qNext, nil, func(data json.RawMessage) (pageResult, error) {
+	pages, err := allPages(ctx, client, qFirst, qNext, nil, func(data json.RawMessage) (pageResult, error) {
+		var r struct {
+			Hubs struct {
+				Pagination struct{ Cursor string `json:"cursor"` } `json:"pagination"`
+				Results    []hubResult                             `json:"results"`
+			} `json:"hubs"`
+		}
+		if err := json.Unmarshal(data, &r); err != nil {
+			return pageResult{}, fmt.Errorf("hubs: %w", err)
+		}
+		raw, _ := json.Marshal(r.Hubs.Results)
+		return pageResult{cursor: r.Hubs.Pagination.Cursor, data: raw}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var all []hubResult
+	for _, p := range pages {
+		var batch []hubResult
+		if err := json.Unmarshal(p, &batch); err != nil {
+			return nil, err
+		}
+		all = append(all, batch...)
+	}
+
+	items := make([]NavItem, len(all))
+	for i, h := range all {
+		items[i] = NavItem{
+			ID:          h.ID,
+			Name:        h.Name,
+			Kind:        "hub",
+			AltID:       h.AlternativeIdentifiers.DataManagementAPIHubID,
+			WebURL:      h.FusionWebURL,
+			IsContainer: true,
+		}
+	}
+	return items, nil
+}
+
+// GetHubsWithToken is a convenience wrapper for config, which has no Fs yet.
+func GetHubsWithToken(ctx context.Context, token string) ([]NavItem, error) {
+	const qFirst = `
+		query GetHubs {
+			hubs(pagination: { limit: 50 }) {
+				pagination { cursor }
+				results {
+					id name fusionWebUrl
+					alternativeIdentifiers { dataManagementAPIHubId }
+				}
+			}
+		}`
+	const qNext = `
+		query GetHubsNext($cursor: String!) {
+			hubs(pagination: { cursor: $cursor, limit: 50 }) {
+				pagination { cursor }
+				results {
+					id name fusionWebUrl
+					alternativeIdentifiers { dataManagementAPIHubId }
+				}
+			}
+		}`
+
+	type hubResult struct {
+		ID                     string `json:"id"`
+		Name                   string `json:"name"`
+		FusionWebURL           string `json:"fusionWebUrl"`
+		AlternativeIdentifiers struct {
+			DataManagementAPIHubID string `json:"dataManagementAPIHubId"`
+		} `json:"alternativeIdentifiers"`
+	}
+
+	pages, err := allPagesWithToken(ctx, token, qFirst, qNext, nil, func(data json.RawMessage) (pageResult, error) {
 		var r struct {
 			Hubs struct {
 				Pagination struct{ Cursor string `json:"cursor"` } `json:"pagination"`
@@ -89,7 +163,7 @@ func GetHubs(ctx context.Context, token string) ([]NavItem, error) {
 // ---------------------------------------------------------------------------
 
 // GetProjects returns all active projects in a hub.
-func GetProjects(ctx context.Context, token, hubID string) ([]NavItem, error) {
+func GetProjects(ctx context.Context, client *http.Client, hubID string) ([]NavItem, error) {
 	const qFirst = `
 		query GetProjects($hubId: ID!) {
 			hub(hubId: $hubId) {
@@ -126,7 +200,7 @@ func GetProjects(ctx context.Context, token, hubID string) ([]NavItem, error) {
 		} `json:"alternativeIdentifiers"`
 	}
 
-	pages, err := allPages(ctx, token, qFirst, qNext, map[string]any{"hubId": hubID}, func(data json.RawMessage) (pageResult, error) {
+	pages, err := allPages(ctx, client, qFirst, qNext, map[string]any{"hubId": hubID}, func(data json.RawMessage) (pageResult, error) {
 		var r struct {
 			Hub struct {
 				Projects struct {
@@ -176,7 +250,7 @@ func GetProjects(ctx context.Context, token, hubID string) ([]NavItem, error) {
 // ---------------------------------------------------------------------------
 
 // GetFolders returns the top-level folders in a project.
-func GetFolders(ctx context.Context, token, projectID string) ([]NavItem, error) {
+func GetFolders(ctx context.Context, client *http.Client, projectID string) ([]NavItem, error) {
 	const qFirst = `
 		query GetFolders($projectId: ID!) {
 			foldersByProject(projectId: $projectId, pagination: { limit: 50 }) {
@@ -197,7 +271,7 @@ func GetFolders(ctx context.Context, token, projectID string) ([]NavItem, error)
 		Name string `json:"name"`
 	}
 
-	pages, err := allPages(ctx, token, qFirst, qNext, map[string]any{"projectId": projectID}, func(data json.RawMessage) (pageResult, error) {
+	pages, err := allPages(ctx, client, qFirst, qNext, map[string]any{"projectId": projectID}, func(data json.RawMessage) (pageResult, error) {
 		var r struct {
 			FoldersByProject struct {
 				Pagination struct{ Cursor string `json:"cursor"` } `json:"pagination"`
@@ -240,7 +314,7 @@ func GetFolders(ctx context.Context, token, projectID string) ([]NavItem, error)
 // ---------------------------------------------------------------------------
 
 // GetProjectItems returns items at the root of a project (not in any folder).
-func GetProjectItems(ctx context.Context, token, projectID string) ([]NavItem, error) {
+func GetProjectItems(ctx context.Context, client *http.Client, projectID string) ([]NavItem, error) {
 	const qFirst = `
 		query GetProjectItems($projectId: ID!) {
 			itemsByProject(projectId: $projectId, pagination: { limit: 50 }) {
@@ -271,7 +345,7 @@ func GetProjectItems(ctx context.Context, token, projectID string) ([]NavItem, e
 		ModifiedOn string `json:"lastModifiedOn"`
 	}
 
-	pages, err := allPages(ctx, token, qFirst, qNext, map[string]any{"projectId": projectID}, func(data json.RawMessage) (pageResult, error) {
+	pages, err := allPages(ctx, client, qFirst, qNext, map[string]any{"projectId": projectID}, func(data json.RawMessage) (pageResult, error) {
 		var r struct {
 			ItemsByProject struct {
 				Pagination struct{ Cursor string `json:"cursor"` } `json:"pagination"`
@@ -312,7 +386,7 @@ func GetProjectItems(ctx context.Context, token, projectID string) ([]NavItem, e
 // ---------------------------------------------------------------------------
 
 // GetItems returns items inside a folder.
-func GetItems(ctx context.Context, token, hubID, folderID string) ([]NavItem, error) {
+func GetItems(ctx context.Context, client *http.Client, hubID, folderID string) ([]NavItem, error) {
 	const qFirst = `
 		query GetItems($hubId: ID!, $folderId: ID!) {
 			itemsByFolder(hubId: $hubId, folderId: $folderId, pagination: { limit: 50 }) {
@@ -343,7 +417,7 @@ func GetItems(ctx context.Context, token, hubID, folderID string) ([]NavItem, er
 		ModifiedOn string `json:"lastModifiedOn"`
 	}
 
-	pages, err := allPages(ctx, token, qFirst, qNext, map[string]any{"hubId": hubID, "folderId": folderID}, func(data json.RawMessage) (pageResult, error) {
+	pages, err := allPages(ctx, client, qFirst, qNext, map[string]any{"hubId": hubID, "folderId": folderID}, func(data json.RawMessage) (pageResult, error) {
 		var r struct {
 			ItemsByFolder struct {
 				Pagination struct{ Cursor string `json:"cursor"` } `json:"pagination"`
@@ -400,7 +474,7 @@ type ItemDetails struct {
 }
 
 // GetItemDetails fetches rich metadata for a single item.
-func GetItemDetails(ctx context.Context, token, hubID, itemID string) (*ItemDetails, error) {
+func GetItemDetails(ctx context.Context, client *http.Client, hubID, itemID string) (*ItemDetails, error) {
 	const q = `
 		query GetItemDetails($hubId: ID!, $itemId: ID!) {
 			item(hubId: $hubId, itemId: $itemId) {
@@ -429,7 +503,7 @@ func GetItemDetails(ctx context.Context, token, hubID, itemID string) (*ItemDeta
 			}
 		}`
 
-	data, err := gqlQuery(ctx, token, q, map[string]any{"hubId": hubID, "itemId": itemID})
+	data, err := gqlQuery(ctx, client, q, map[string]any{"hubId": hubID, "itemId": itemID})
 	if err != nil {
 		return nil, fmt.Errorf("item details: %w", err)
 	}

@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rclone/rclone/fs"
 )
@@ -16,11 +19,111 @@ const (
 	dmBaseURL  = "https://developer.api.autodesk.com"
 	dmDataPath = "/data/v1"
 	ossPath    = "/oss/v2"
+
+	defaultChunkSize = 100 * 1024 * 1024 // 100 MB
 )
+
+// doAPIRequest executes an HTTP request through the oauth2 client with
+// throttling and retry logic for 429/5xx responses.
+func (f *Fs) doAPIRequest(ctx context.Context, req *http.Request) (*http.Response, error) {
+	var lastErr error
+	delay := minRetryDelay
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			delay *= 2
+			if delay > maxRetryDelay {
+				delay = maxRetryDelay
+			}
+		}
+
+		// Throttle: acquire semaphore + rate limit.
+		if throttle != nil {
+			if err := throttle.acquire(ctx); err != nil {
+				return nil, err
+			}
+		}
+
+		// Clone the request body for retries if it has one.
+		var bodyBytes []byte
+		if req.Body != nil && attempt == 0 {
+			var err error
+			bodyBytes, err = io.ReadAll(req.Body)
+			if err != nil {
+				if throttle != nil {
+					throttle.release()
+				}
+				return nil, err
+			}
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			// Store for retries.
+			req = req.WithContext(ctx)
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		} else if bodyBytes != nil {
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+
+		resp, err := f.srv.Do(req)
+		if throttle != nil {
+			throttle.release()
+		}
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Handle 401 Unauthorized.
+		if resp.StatusCode == http.StatusUnauthorized {
+			resp.Body.Close()
+			return nil, fs.ErrorPermissionDenied
+		}
+
+		// Handle 403 Forbidden.
+		if resp.StatusCode == http.StatusForbidden {
+			resp.Body.Close()
+			return nil, fmt.Errorf("access denied (HTTP 403): %w", fs.ErrorPermissionDenied)
+		}
+
+		// Handle 404 Not Found.
+		if resp.StatusCode == http.StatusNotFound {
+			resp.Body.Close()
+			return nil, fs.ErrorObjectNotFound
+		}
+
+		// Handle 429 Too Many Requests — retry.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			resp.Body.Close()
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if secs, parseErr := strconv.Atoi(ra); parseErr == nil {
+					delay = time.Duration(secs) * time.Second
+				}
+			}
+			lastErr = fmt.Errorf("rate limited (HTTP 429)")
+			continue
+		}
+
+		// Handle 5xx Server Errors — retry.
+		if resp.StatusCode >= 500 {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("server error (HTTP %d): %s", resp.StatusCode, body)
+			continue
+		}
+
+		return resp, nil
+	}
+
+	return nil, fmt.Errorf("giving up after %d retries: %w", maxRetries, lastErr)
+}
 
 // createStorage creates an OSS storage location for a file upload.
 // Returns the storage object ID (URN).
-func (f *Fs) createStorage(ctx context.Context, token, projectDM, folderDM, filename string) (string, error) {
+func (f *Fs) createStorage(ctx context.Context, projectDM, folderDM, filename string) (string, error) {
 	payload := map[string]any{
 		"jsonapi": map[string]string{"version": "1.0"},
 		"data": map[string]any{
@@ -50,9 +153,8 @@ func (f *Fs) createStorage(ctx context.Context, token, projectDM, folderDM, file
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/vnd.api+json")
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := f.doAPIRequest(ctx, req)
 	if err != nil {
 		return "", err
 	}
@@ -81,21 +183,34 @@ func (f *Fs) createStorage(ctx context.Context, token, projectDM, folderDM, file
 
 // uploadToStorage uploads file content via the signed S3 upload flow.
 // storageID is the URN returned by createStorage (format: "urn:adsk.objects:os.object:bucket/key").
-func (f *Fs) uploadToStorage(ctx context.Context, token, storageID string, in io.Reader, size int64) error {
+// For files larger than the chunk size, uses multipart upload.
+func (f *Fs) uploadToStorage(ctx context.Context, storageID string, in io.Reader, size int64) error {
 	bucketKey, objectKey, err := parseStorageURN(storageID)
 	if err != nil {
 		return err
 	}
 
+	chunkSize := int64(defaultChunkSize)
+	if f.opt.UploadChunkSize > 0 {
+		chunkSize = int64(f.opt.UploadChunkSize)
+	}
+
+	if size > 0 && size > chunkSize {
+		return f.uploadMultipart(ctx, bucketKey, objectKey, in, size, chunkSize)
+	}
+	return f.uploadSinglePart(ctx, bucketKey, objectKey, in, size)
+}
+
+// uploadSinglePart uploads file content as a single part via signed S3 URL.
+func (f *Fs) uploadSinglePart(ctx context.Context, bucketKey, objectKey string, in io.Reader, size int64) error {
 	// Step 1: Get signed S3 upload URLs.
 	signedURL := fmt.Sprintf("%s%s/buckets/%s/objects/%s/signeds3upload", dmBaseURL, ossPath, bucketKey, objectKey)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, signedURL, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := f.doAPIRequest(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -122,7 +237,7 @@ func (f *Fs) uploadToStorage(ctx context.Context, token, storageID string, in io
 		return fmt.Errorf("no upload URLs returned")
 	}
 
-	// Step 2: Upload content to the signed S3 URL.
+	// Step 2: Upload content to the signed S3 URL (no auth needed — pre-signed).
 	uploadReq, err := http.NewRequestWithContext(ctx, http.MethodPut, signedResult.URLs[0], in)
 	if err != nil {
 		return err
@@ -157,10 +272,9 @@ func (f *Fs) uploadToStorage(ctx context.Context, token, storageID string, in io
 	if err != nil {
 		return err
 	}
-	completeReq.Header.Set("Authorization", "Bearer "+token)
 	completeReq.Header.Set("Content-Type", "application/json")
 
-	completeResp, err := http.DefaultClient.Do(completeReq)
+	completeResp, err := f.doAPIRequest(ctx, completeReq)
 	if err != nil {
 		return err
 	}
@@ -174,8 +288,118 @@ func (f *Fs) uploadToStorage(ctx context.Context, token, storageID string, in io
 	return nil
 }
 
+// uploadMultipart uploads file content in multiple parts via signed S3 URLs.
+func (f *Fs) uploadMultipart(ctx context.Context, bucketKey, objectKey string, in io.Reader, size, chunkSize int64) error {
+	numParts := int(math.Ceil(float64(size) / float64(chunkSize)))
+	if numParts < 2 {
+		numParts = 2
+	}
+
+	// Step 1: Get signed S3 upload URLs for N parts.
+	signedURL := fmt.Sprintf("%s%s/buckets/%s/objects/%s/signeds3upload?parts=%d",
+		dmBaseURL, ossPath, bucketKey, objectKey, numParts)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, signedURL, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := f.doAPIRequest(ctx, req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("get signed multipart upload URLs failed (HTTP %d): %s", resp.StatusCode, raw)
+	}
+
+	var signedResult struct {
+		URLs      []string `json:"urls"`
+		UploadKey string   `json:"uploadKey"`
+	}
+	if err := json.Unmarshal(raw, &signedResult); err != nil {
+		return fmt.Errorf("parsing signed multipart upload response: %w", err)
+	}
+
+	if len(signedResult.URLs) < numParts {
+		return fmt.Errorf("expected %d upload URLs, got %d", numParts, len(signedResult.URLs))
+	}
+
+	// Step 2: Upload each part and collect ETags.
+	etags := make([]string, numParts)
+	remaining := size
+
+	for i := 0; i < numParts; i++ {
+		partSize := chunkSize
+		if remaining < partSize {
+			partSize = remaining
+		}
+		remaining -= partSize
+
+		partReader := io.LimitReader(in, partSize)
+
+		uploadReq, err := http.NewRequestWithContext(ctx, http.MethodPut, signedResult.URLs[i], partReader)
+		if err != nil {
+			return fmt.Errorf("creating part %d upload request: %w", i+1, err)
+		}
+		uploadReq.Header.Set("Content-Type", "application/octet-stream")
+		uploadReq.ContentLength = partSize
+
+		// S3 signed URLs don't need auth headers.
+		uploadResp, err := http.DefaultClient.Do(uploadReq)
+		if err != nil {
+			return fmt.Errorf("uploading part %d: %w", i+1, err)
+		}
+
+		if uploadResp.StatusCode != http.StatusOK && uploadResp.StatusCode != http.StatusCreated {
+			respBody, _ := io.ReadAll(uploadResp.Body)
+			uploadResp.Body.Close()
+			return fmt.Errorf("S3 multipart upload part %d failed (HTTP %d): %s", i+1, uploadResp.StatusCode, respBody)
+		}
+
+		etag := uploadResp.Header.Get("ETag")
+		uploadResp.Body.Close()
+		etags[i] = etag
+	}
+
+	// Step 3: Complete the multipart upload with ETags.
+	completePayload := map[string]any{
+		"uploadKey": signedResult.UploadKey,
+		"eTags":     etags,
+	}
+	completeBody, err := json.Marshal(completePayload)
+	if err != nil {
+		return err
+	}
+
+	completeURL := fmt.Sprintf("%s%s/buckets/%s/objects/%s/signeds3upload", dmBaseURL, ossPath, bucketKey, objectKey)
+	completeReq, err := http.NewRequestWithContext(ctx, http.MethodPost, completeURL, bytes.NewReader(completeBody))
+	if err != nil {
+		return err
+	}
+	completeReq.Header.Set("Content-Type", "application/json")
+
+	completeResp, err := f.doAPIRequest(ctx, completeReq)
+	if err != nil {
+		return err
+	}
+	defer completeResp.Body.Close()
+
+	if completeResp.StatusCode != http.StatusOK && completeResp.StatusCode != http.StatusCreated {
+		respBody, _ := io.ReadAll(completeResp.Body)
+		return fmt.Errorf("complete multipart upload failed (HTTP %d): %s", completeResp.StatusCode, respBody)
+	}
+
+	return nil
+}
+
 // createFirstVersion creates the first version of an item (new file).
-func (f *Fs) createFirstVersion(ctx context.Context, token, projectDM, folderDM, filename, storageID string) (string, error) {
+func (f *Fs) createFirstVersion(ctx context.Context, projectDM, folderDM, filename, storageID string) (string, error) {
 	payload := map[string]any{
 		"jsonapi": map[string]string{"version": "1.0"},
 		"data": map[string]any{
@@ -236,9 +460,8 @@ func (f *Fs) createFirstVersion(ctx context.Context, token, projectDM, folderDM,
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/vnd.api+json")
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := f.doAPIRequest(ctx, req)
 	if err != nil {
 		return "", err
 	}
@@ -266,7 +489,7 @@ func (f *Fs) createFirstVersion(ctx context.Context, token, projectDM, folderDM,
 }
 
 // createNextVersion creates a subsequent version of an existing item.
-func (f *Fs) createNextVersion(ctx context.Context, token, projectDM, itemDM, filename, storageID string) error {
+func (f *Fs) createNextVersion(ctx context.Context, projectDM, itemDM, filename, storageID string) error {
 	payload := map[string]any{
 		"jsonapi": map[string]string{"version": "1.0"},
 		"data": map[string]any{
@@ -306,9 +529,8 @@ func (f *Fs) createNextVersion(ctx context.Context, token, projectDM, itemDM, fi
 		return err
 	}
 	req.Header.Set("Content-Type", "application/vnd.api+json")
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := f.doAPIRequest(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -324,15 +546,14 @@ func (f *Fs) createNextVersion(ctx context.Context, token, projectDM, itemDM, fi
 
 // getTopFolders returns the top-level folders for a project via the DM REST API.
 // Each returned entry has its DM API folder ID.
-func (f *Fs) getTopFolders(ctx context.Context, token, hubDM, projectDM string) ([]dmEntry, error) {
+func (f *Fs) getTopFolders(ctx context.Context, hubDM, projectDM string) ([]dmEntry, error) {
 	url := fmt.Sprintf("%s/project/v1/hubs/%s/projects/%s/topFolders", dmBaseURL, hubDM, projectDM)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := f.doAPIRequest(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -367,15 +588,14 @@ func (f *Fs) getTopFolders(ctx context.Context, token, hubDM, projectDM string) 
 }
 
 // getFolderContents returns all entries (folders and items) inside a folder via the DM REST API.
-func (f *Fs) getFolderContents(ctx context.Context, token, projectDM, folderDM string) ([]dmEntry, error) {
+func (f *Fs) getFolderContents(ctx context.Context, projectDM, folderDM string) ([]dmEntry, error) {
 	reqURL := fmt.Sprintf("%s%s/projects/%s/folders/%s/contents", dmBaseURL, dmDataPath, projectDM, folderDM)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := f.doAPIRequest(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -426,8 +646,8 @@ type dmEntry struct {
 }
 
 // resolveItemDM finds the DM API item ID for a file by name within a folder.
-func (f *Fs) resolveItemDM(ctx context.Context, token, projectDM, folderDM, itemName string) (string, error) {
-	entries, err := f.getFolderContents(ctx, token, projectDM, folderDM)
+func (f *Fs) resolveItemDM(ctx context.Context, projectDM, folderDM, itemName string) (string, error) {
+	entries, err := f.getFolderContents(ctx, projectDM, folderDM)
 	if err != nil {
 		return "", err
 	}
@@ -446,13 +666,13 @@ func (f *Fs) resolveItemDM(ctx context.Context, token, projectDM, folderDM, item
 // the project and the user-visible folders. The GraphQL API skips this layer,
 // so folderNames[0] is a user-visible folder that lives INSIDE one of the top
 // folders, not a top folder itself.
-func (f *Fs) resolveFolderDMPath(ctx context.Context, token, hubDM, projectDM string, folderNames []string) (string, error) {
+func (f *Fs) resolveFolderDMPath(ctx context.Context, hubDM, projectDM string, folderNames []string) (string, error) {
 	if len(folderNames) == 0 {
 		return "", nil
 	}
 
 	// Get top-level (root) folders — these are invisible containers like "Project Files".
-	topFolders, err := f.getTopFolders(ctx, token, hubDM, projectDM)
+	topFolders, err := f.getTopFolders(ctx, hubDM, projectDM)
 	if err != nil {
 		return "", fmt.Errorf("listing top folders: %w", err)
 	}
@@ -469,7 +689,7 @@ func (f *Fs) resolveFolderDMPath(ctx context.Context, token, hubDM, projectDM st
 	// If not found at top level, search inside each top folder for the first folder name.
 	if currentDM == "" {
 		for _, tf := range topFolders {
-			contents, err := f.getFolderContents(ctx, token, projectDM, tf.ID)
+			contents, err := f.getFolderContents(ctx, projectDM, tf.ID)
 			if err != nil {
 				continue
 			}
@@ -491,7 +711,7 @@ func (f *Fs) resolveFolderDMPath(ctx context.Context, token, hubDM, projectDM st
 
 	// Walk deeper folders.
 	for i := 1; i < len(folderNames); i++ {
-		subFolders, err := f.getFolderContents(ctx, token, projectDM, currentDM)
+		subFolders, err := f.getFolderContents(ctx, projectDM, currentDM)
 		if err != nil {
 			return "", fmt.Errorf("listing subfolder contents: %w", err)
 		}
@@ -513,16 +733,15 @@ func (f *Fs) resolveFolderDMPath(ctx context.Context, token, hubDM, projectDM st
 
 // getDownloadURLWithProject gets a signed download URL for an item within a project.
 // Uses the tip version's storage URN to get a signed S3 download URL.
-func (f *Fs) getDownloadURLWithProject(ctx context.Context, token, projectDM, itemDM string) (string, error) {
+func (f *Fs) getDownloadURLWithProject(ctx context.Context, projectDM, itemDM string) (string, error) {
 	// Step 1: Get the tip version to find the storage URN.
 	tipURL := fmt.Sprintf("%s%s/projects/%s/items/%s/tip", dmBaseURL, dmDataPath, projectDM, itemDM)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tipURL, nil)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := f.doAPIRequest(ctx, req)
 	if err != nil {
 		return "", err
 	}
@@ -570,9 +789,8 @@ func (f *Fs) getDownloadURLWithProject(ctx context.Context, token, projectDM, it
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err = http.DefaultClient.Do(req)
+	resp, err = f.doAPIRequest(ctx, req)
 	if err != nil {
 		return "", err
 	}
@@ -602,7 +820,7 @@ func (f *Fs) getDownloadURLWithProject(ctx context.Context, token, projectDM, it
 }
 
 // createFolder creates a new folder under the given parent.
-func (f *Fs) createFolder(ctx context.Context, token, projectDM, parentFolderDM, name string) (string, error) {
+func (f *Fs) createFolder(ctx context.Context, projectDM, parentFolderDM, name string) (string, error) {
 	payload := map[string]any{
 		"jsonapi": map[string]string{"version": "1.0"},
 		"data": map[string]any{
@@ -636,9 +854,8 @@ func (f *Fs) createFolder(ctx context.Context, token, projectDM, parentFolderDM,
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/vnd.api+json")
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := f.doAPIRequest(ctx, req)
 	if err != nil {
 		return "", err
 	}
