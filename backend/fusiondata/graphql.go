@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rclone/rclone/fs"
 	"golang.org/x/oauth2"
 )
 
@@ -45,6 +46,7 @@ func initThrottle(ratePerSecond int) {
 
 // acquire waits for both a semaphore slot and a rate limiter tick.
 func (t *apiThrottle) acquire(ctx context.Context) error {
+	fs.Debugf(nil, "throttle: acquiring slot")
 	// Acquire semaphore first.
 	select {
 	case t.sem <- struct{}{}:
@@ -59,12 +61,14 @@ func (t *apiThrottle) acquire(ctx context.Context) error {
 		<-t.sem
 		return ctx.Err()
 	}
+	fs.Debugf(nil, "throttle: slot acquired")
 	return nil
 }
 
 // release returns the semaphore slot.
 func (t *apiThrottle) release() {
 	<-t.sem
+	fs.Debugf(nil, "throttle: slot released")
 }
 
 // region is the X-Ads-Region header value sent with every request.
@@ -108,6 +112,17 @@ type gqlResponse struct {
 // auto-injects Bearer tokens). Includes rate limiting and automatic retry
 // with exponential backoff on rate-limit errors.
 func gqlQuery(ctx context.Context, client *http.Client, q string, vars map[string]any) (json.RawMessage, error) {
+	// Extract query name for logging (e.g. "query GetHubs" -> "GetHubs").
+	queryName := q
+	if idx := strings.Index(q, "("); idx > 0 {
+		queryName = strings.TrimSpace(q[:idx])
+	}
+	if len(queryName) > 80 {
+		queryName = queryName[:80]
+	}
+	queryName = strings.TrimSpace(queryName)
+	fs.Debugf(nil, "gqlQuery: executing %q vars=%v", queryName, vars)
+
 	body, err := json.Marshal(gqlRequest{Query: q, Variables: vars})
 	if err != nil {
 		return nil, err
@@ -118,6 +133,7 @@ func gqlQuery(ctx context.Context, client *http.Client, q string, vars map[strin
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
+			fs.Debugf(nil, "gqlQuery: retry attempt %d/%d delay=%v", attempt, maxRetries, delay)
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
@@ -166,6 +182,7 @@ func gqlQuery(ctx context.Context, client *http.Client, q string, vars map[strin
 
 		// Retry on 429 Too Many Requests.
 		if resp.StatusCode == http.StatusTooManyRequests {
+			fs.Infof(nil, "gqlQuery: rate limited (429), will retry")
 			if ra := resp.Header.Get("Retry-After"); ra != "" {
 				if secs, err := strconv.Atoi(ra); err == nil {
 					delay = time.Duration(secs) * time.Second

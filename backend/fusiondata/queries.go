@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/rclone/rclone/fs"
 )
 
 // ---------------------------------------------------------------------------
@@ -16,6 +18,7 @@ import (
 // GetHubs returns all hubs accessible to the authenticated user.
 // Uses the provided HTTP client (oauth2 auto-injects tokens).
 func GetHubs(ctx context.Context, client *http.Client) ([]NavItem, error) {
+	fs.Debugf(nil, "GetHubs: querying all hubs")
 	const qFirst = `
 		query GetHubs {
 			hubs(pagination: { limit: 50 }) {
@@ -83,11 +86,13 @@ func GetHubs(ctx context.Context, client *http.Client) ([]NavItem, error) {
 			IsContainer: true,
 		}
 	}
+	fs.Debugf(nil, "GetHubs: found %d hubs", len(items))
 	return items, nil
 }
 
 // GetHubsWithToken is a convenience wrapper for config, which has no Fs yet.
 func GetHubsWithToken(ctx context.Context, token string) ([]NavItem, error) {
+	fs.Debugf(nil, "GetHubsWithToken: querying hubs with token")
 	const qFirst = `
 		query GetHubs {
 			hubs(pagination: { limit: 50 }) {
@@ -155,6 +160,7 @@ func GetHubsWithToken(ctx context.Context, token string) ([]NavItem, error) {
 			IsContainer: true,
 		}
 	}
+	fs.Debugf(nil, "GetHubsWithToken: found %d hubs", len(items))
 	return items, nil
 }
 
@@ -164,6 +170,7 @@ func GetHubsWithToken(ctx context.Context, token string) ([]NavItem, error) {
 
 // GetProjects returns all active projects in a hub.
 func GetProjects(ctx context.Context, client *http.Client, hubID string) ([]NavItem, error) {
+	fs.Debugf(nil, "GetProjects: hubID=%q", hubID)
 	const qFirst = `
 		query GetProjects($hubId: ID!) {
 			hub(hubId: $hubId) {
@@ -242,6 +249,7 @@ func GetProjects(ctx context.Context, client *http.Client, hubID string) ([]NavI
 			IsContainer: true,
 		})
 	}
+	fs.Debugf(nil, "GetProjects: found %d active projects", len(items))
 	return items, nil
 }
 
@@ -251,6 +259,7 @@ func GetProjects(ctx context.Context, client *http.Client, hubID string) ([]NavI
 
 // GetFolders returns the top-level folders in a project.
 func GetFolders(ctx context.Context, client *http.Client, projectID string) ([]NavItem, error) {
+	fs.Debugf(nil, "GetFolders: projectID=%q", projectID)
 	const qFirst = `
 		query GetFolders($projectId: ID!) {
 			foldersByProject(projectId: $projectId, pagination: { limit: 50 }) {
@@ -306,6 +315,7 @@ func GetFolders(ctx context.Context, client *http.Client, projectID string) ([]N
 			IsContainer: true,
 		}
 	}
+	fs.Debugf(nil, "GetFolders: found %d folders", len(items))
 	return items, nil
 }
 
@@ -315,6 +325,7 @@ func GetFolders(ctx context.Context, client *http.Client, projectID string) ([]N
 
 // GetProjectItems returns items at the root of a project (not in any folder).
 func GetProjectItems(ctx context.Context, client *http.Client, projectID string) ([]NavItem, error) {
+	fs.Debugf(nil, "GetProjectItems: projectID=%q", projectID)
 	const qFirst = `
 		query GetProjectItems($projectId: ID!) {
 			itemsByProject(projectId: $projectId, pagination: { limit: 50 }) {
@@ -378,6 +389,7 @@ func GetProjectItems(ctx context.Context, client *http.Client, projectID string)
 		items[i].ModTime = parseTime(it.ModifiedOn)
 		items[i].MimeType = it.MimeType
 	}
+	fs.Debugf(nil, "GetProjectItems: found %d items", len(items))
 	return items, nil
 }
 
@@ -387,6 +399,7 @@ func GetProjectItems(ctx context.Context, client *http.Client, projectID string)
 
 // GetItems returns items inside a folder.
 func GetItems(ctx context.Context, client *http.Client, hubID, folderID string) ([]NavItem, error) {
+	fs.Debugf(nil, "GetItems: hubID=%q folderID=%q", hubID, folderID)
 	const qFirst = `
 		query GetItems($hubId: ID!, $folderId: ID!) {
 			itemsByFolder(hubId: $hubId, folderId: $folderId, pagination: { limit: 50 }) {
@@ -450,6 +463,7 @@ func GetItems(ctx context.Context, client *http.Client, hubID, folderID string) 
 		items[i].ModTime = parseTime(it.ModifiedOn)
 		items[i].MimeType = it.MimeType
 	}
+	fs.Debugf(nil, "GetItems: found %d items in folder=%q", len(items), folderID)
 	return items, nil
 }
 
@@ -475,6 +489,7 @@ type ItemDetails struct {
 
 // GetItemDetails fetches rich metadata for a single item.
 func GetItemDetails(ctx context.Context, client *http.Client, hubID, itemID string) (*ItemDetails, error) {
+	fs.Debugf(nil, "GetItemDetails: hubID=%q itemID=%q", hubID, itemID)
 	const q = `
 		query GetItemDetails($hubId: ID!, $itemId: ID!) {
 			item(hubId: $hubId, itemId: $itemId) {
@@ -531,7 +546,7 @@ func GetItemDetails(ctx context.Context, client *http.Client, hubID, itemID stri
 		return nil, fmt.Errorf("item details decode: %w", err)
 	}
 
-	return &ItemDetails{
+	details := &ItemDetails{
 		ID:            raw.Item.ID,
 		Name:          raw.Item.Name,
 		Typename:      raw.Item.Typename,
@@ -544,7 +559,9 @@ func GetItemDetails(ctx context.Context, client *http.Client, hubID, itemID stri
 		ModifiedOn:    parseTime(raw.Item.ModifiedOn),
 		ModifiedBy:    raw.Item.ModifiedBy.fullName(),
 		VersionNumber: raw.Item.TipVersion.VersionNumber,
-	}, nil
+	}
+	fs.Debugf(nil, "GetItemDetails: item=%q type=%q version=%d", details.Name, details.Typename, details.VersionNumber)
+	return details, nil
 }
 
 // ---------------------------------------------------------------------------

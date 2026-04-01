@@ -38,6 +38,7 @@ func splitPath(p string) []string {
 //	"ProjectName/Folder/Sub"     -> folder (nested)
 //	"ProjectName/Folder/file.f3d"-> item
 func (f *Fs) resolvePath(ctx context.Context, p string) (*resolvedPath, error) {
+	fs.Debugf(f, "resolvePath: path=%q", p)
 	segments := splitPath(p)
 
 	if len(segments) == 0 {
@@ -57,6 +58,7 @@ func (f *Fs) resolvePath(ctx context.Context, p string) (*resolvedPath, error) {
 	if err != nil {
 		return nil, fmt.Errorf("project %q not found: %w", segments[0], err)
 	}
+	fs.Debugf(f, "resolvePath: segment[0]=%q resolved to project id=%q", segments[0], project.ID)
 
 	if len(segments) == 1 {
 		return &resolvedPath{
@@ -80,6 +82,7 @@ func (f *Fs) resolvePath(ctx context.Context, p string) (*resolvedPath, error) {
 		if err != nil {
 			return nil, fmt.Errorf("path segment %q not found in %s: %w", segments[i], strings.Join(segments[:i], "/"), err)
 		}
+		fs.Debugf(f, "resolvePath: segment[%d]=%q resolved to %s id=%q", i, segments[i], child.Kind, child.ID)
 
 		if i == len(segments)-1 {
 			// Last segment — return whatever it is.
@@ -112,8 +115,10 @@ func (f *Fs) resolvePath(ctx context.Context, p string) (*resolvedPath, error) {
 func (f *Fs) findChildByName(ctx context.Context, parentID, parentKind, name string) (*NavItem, error) {
 	// Check cache first.
 	if cached := f.cache.getChild(parentID, name); cached != nil {
+		fs.Debugf(f, "findChildByName: cache hit for %q in parent=%q", name, parentID)
 		return cached, nil
 	}
+	fs.Debugf(f, "findChildByName: cache miss for %q in parent=%q, fetching", name, parentID)
 
 	// Fetch children and populate cache.
 	children, err := f.listChildren(ctx, parentID, parentKind)
@@ -134,9 +139,14 @@ func (f *Fs) findChildByName(ctx context.Context, parentID, parentKind, name str
 // listChildren returns all children of a parent node.
 // Uses f.srv (oauth2 HTTP client) for GraphQL queries.
 func (f *Fs) listChildren(ctx context.Context, parentID, parentKind string) ([]NavItem, error) {
+	fs.Debugf(f, "listChildren: parentKind=%q parentID=%q", parentKind, parentID)
 	switch parentKind {
 	case "hub":
-		return GetProjects(ctx, f.srv, f.hubID)
+		items, err := GetProjects(ctx, f.srv, f.hubID)
+		if err == nil {
+			fs.Debugf(f, "listChildren: hub returned %d projects", len(items))
+		}
+		return items, err
 	case "project":
 		// A project can contain both top-level folders and root items.
 		folders, err := GetFolders(ctx, f.srv, parentID)
@@ -147,9 +157,15 @@ func (f *Fs) listChildren(ctx context.Context, parentID, parentKind string) ([]N
 		if err != nil {
 			return nil, err
 		}
-		return append(folders, items...), nil
+		all := append(folders, items...)
+		fs.Debugf(f, "listChildren: project returned %d children (%d folders, %d items)", len(all), len(folders), len(items))
+		return all, nil
 	case "folder":
-		return GetItems(ctx, f.srv, f.hubID, parentID)
+		items, err := GetItems(ctx, f.srv, f.hubID, parentID)
+		if err == nil {
+			fs.Debugf(f, "listChildren: folder returned %d children", len(items))
+		}
+		return items, err
 	default:
 		return nil, fmt.Errorf("cannot list children of %s", parentKind)
 	}

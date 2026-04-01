@@ -3,6 +3,8 @@ package fusiondata
 import (
 	"sync"
 	"time"
+
+	"github.com/rclone/rclone/fs"
 )
 
 // pathCache is a TTL-based cache mapping (parentID, childName) -> NavItem.
@@ -61,6 +63,7 @@ func (c *pathCache) putChild(parentID, childName string, item *NavItem) {
 // replaceChildren atomically removes all existing children of a parent
 // and replaces them with the given items.
 func (c *pathCache) replaceChildren(parentID string, items []NavItem) {
+	fs.Debugf(nil, "cache.replaceChildren: parentID=%q count=%d", parentID, len(items))
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -81,6 +84,7 @@ func (c *pathCache) replaceChildren(parentID string, items []NavItem) {
 
 // invalidate removes all cached children of a parent.
 func (c *pathCache) invalidate(parentID string) {
+	fs.Debugf(nil, "cache.invalidate: parentID=%q", parentID)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

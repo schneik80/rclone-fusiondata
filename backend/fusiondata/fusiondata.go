@@ -132,6 +132,7 @@ func init() {
 //	"oauth_done" -> list hubs and ask user to choose
 //	"hub_chosen" -> save hub_id and finish
 func configHandler(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
+	fs.Debugf(nil, "Config handler: state=%q", config.State)
 	switch config.State {
 	case "":
 		// Step 1: Perform OAuth2 PKCE flow.
@@ -153,6 +154,7 @@ func configHandler(ctx context.Context, name string, m configmap.Mapper, config 
 		}
 		m.Set("token", string(tokenJSON))
 
+		fs.Debugf(nil, "Config handler: OAuth login complete, transitioning to oauth_done")
 		return fs.ConfigGoto("oauth_done")
 
 	case "oauth_done":
@@ -194,6 +196,7 @@ func configHandler(ctx context.Context, name string, m configmap.Mapper, config 
 
 	case "hub_chosen":
 		// Step 3: Save hub selection.
+		fs.Debugf(nil, "Config handler: hub chosen, saving selection")
 		hubID := config.Result
 		if hubID == "" {
 			return nil, errors.New("no hub selected")
@@ -477,6 +480,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		cache:  newPathCache(cacheTTL),
 	}
 
+	fs.Infof(f, "NewFs: hub=%q region=%q cacheTTL=%v root=%q", opt.HubName, opt.Region, cacheTTL, root)
+
 	SetRegion(opt.Region)
 
 	// Resolve hub DM ID for REST API write operations using the oauth2 client.
@@ -485,6 +490,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		for _, h := range hubs {
 			if h.ID == opt.HubID {
 				f.hubDM = h.AltID
+				fs.Debugf(f, "NewFs: resolved hub DM ID=%q", f.hubDM)
 				break
 			}
 		}
@@ -546,9 +552,11 @@ func (f *Fs) getToken() (string, error) {
 // List lists the objects and directories in dir.
 func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	fullDir := path.Join(f.root, dir)
+	fs.Infof(f, "List: dir=%q fullDir=%q", dir, fullDir)
 
 	resolved, err := f.resolvePath(ctx, fullDir)
 	if err != nil {
+		fs.Debugf(f, "List: dir=%q not found: %v", dir, err)
 		return nil, fs.ErrorDirNotFound
 	}
 
@@ -637,6 +645,7 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 		f.cache.replaceChildren(resolved.id, items)
 	}
 
+	fs.Infof(f, "List: dir=%q found %d entries", dir, len(entries))
 	return entries, nil
 }
 
@@ -674,6 +683,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	fullPath := path.Join(f.root, remote)
 	dir, leaf := path.Split(fullPath)
 	dir = strings.TrimSuffix(dir, "/")
+	fs.Debugf(f, "Put: remote=%q leaf=%q size=%d", remote, leaf, src.Size())
 
 	// Skip temp files from macOS safe-save — they'll be followed by a rename
 	// to the real filename, which rclone handles via Update.
@@ -717,6 +727,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	existing, _ := f.resolvePath(ctx, fullPath)
 	if existing != nil && existing.kind != "hub" && existing.kind != "project" && existing.kind != "folder" {
 		// File exists — resolve its DM item ID and create new version.
+		fs.Debugf(f, "Put: file %q already exists, creating new version", leaf)
 		itemDM, err := f.resolveItemDM(ctx, projectDM, folderDM, leaf)
 		if err == nil && itemDM != "" {
 			if err := f.createNextVersion(ctx, projectDM, itemDM, leaf, storageID); err != nil {
@@ -736,6 +747,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	}
 
 	// New file — create first version.
+	fs.Debugf(f, "Put: creating first version of %q", leaf)
 	itemID, err := f.createFirstVersion(ctx, projectDM, folderDM, leaf, storageID)
 	if err != nil {
 		return nil, fmt.Errorf("creating item version: %w", err)
@@ -795,6 +807,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 		return fmt.Errorf("resolving parent folder DM ID: %w", err)
 	}
 
+	fs.Debugf(f, "Mkdir: creating folder %q in project=%q parent=%q", leaf, parent.projectDM, parentFolderDM)
 	_, err = f.createFolder(ctx, parent.projectDM, parentFolderDM, leaf)
 	if err != nil {
 		return err
@@ -815,6 +828,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 // resolveFolderDMForPath resolves an rclone directory path to a DM API folder ID
 // by walking the folder tree via the REST Data Management API.
 func (f *Fs) resolveFolderDMForPath(ctx context.Context, dir string) (string, error) {
+	fs.Debugf(f, "resolveFolderDMForPath: dir=%q", dir)
 	segments := splitPath(dir)
 	if len(segments) < 2 {
 		// At project level — find the project's root folder via DM API.
@@ -903,6 +917,7 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 				tickerC = ticker.C
 
 			case <-tickerC:
+				fs.Infof(f, "ChangeNotify: poll cycle starting")
 				f.pollForChanges(ctx, notifyFunc, snapshots)
 			}
 		}
@@ -960,6 +975,7 @@ func (f *Fs) pollDir(ctx context.Context, dir string, notifyFunc func(string, fs
 			oldSize, existed := prev.entries[name]
 			if !existed || oldSize != size {
 				changed = true
+				fs.Debugf(f, "ChangeNotify: changed entry=%q existed=%v", name, existed)
 				if size == -1 {
 					notifyFunc(name, fs.EntryDirectory)
 				} else {
@@ -971,6 +987,7 @@ func (f *Fs) pollDir(ctx context.Context, dir string, notifyFunc func(string, fs
 		for name, size := range prev.entries {
 			if _, exists := current[name]; !exists {
 				changed = true
+				fs.Debugf(f, "ChangeNotify: deleted entry=%q", name)
 				if size == -1 {
 					notifyFunc(name, fs.EntryDirectory)
 				} else {
@@ -980,6 +997,7 @@ func (f *Fs) pollDir(ctx context.Context, dir string, notifyFunc func(string, fs
 		}
 		if changed {
 			// Also notify the parent directory itself.
+			fs.Infof(f, "ChangeNotify: changes detected in dir=%q", dir)
 			notifyFunc(dir, fs.EntryDirectory)
 		}
 	}

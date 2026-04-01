@@ -26,11 +26,13 @@ const (
 // doAPIRequest executes an HTTP request through the oauth2 client with
 // throttling and retry logic for 429/5xx responses.
 func (f *Fs) doAPIRequest(ctx context.Context, req *http.Request) (*http.Response, error) {
+	fs.Debugf(f, "doAPIRequest: %s %s", req.Method, req.URL.String())
 	var lastErr error
 	delay := minRetryDelay
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
+			fs.Debugf(f, "doAPIRequest: retry attempt %d/%d delay=%v for %s %s", attempt, maxRetries, delay, req.Method, req.URL.String())
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
@@ -97,6 +99,7 @@ func (f *Fs) doAPIRequest(ctx context.Context, req *http.Request) (*http.Respons
 
 		// Handle 429 Too Many Requests — retry.
 		if resp.StatusCode == http.StatusTooManyRequests {
+			fs.Infof(f, "doAPIRequest: rate limited (429) for %s %s, will retry", req.Method, req.URL.String())
 			resp.Body.Close()
 			if ra := resp.Header.Get("Retry-After"); ra != "" {
 				if secs, parseErr := strconv.Atoi(ra); parseErr == nil {
@@ -124,6 +127,7 @@ func (f *Fs) doAPIRequest(ctx context.Context, req *http.Request) (*http.Respons
 // createStorage creates an OSS storage location for a file upload.
 // Returns the storage object ID (URN).
 func (f *Fs) createStorage(ctx context.Context, projectDM, folderDM, filename string) (string, error) {
+	fs.Debugf(f, "createStorage: project=%q folder=%q filename=%q", projectDM, folderDM, filename)
 	payload := map[string]any{
 		"jsonapi": map[string]string{"version": "1.0"},
 		"data": map[string]any{
@@ -196,8 +200,10 @@ func (f *Fs) uploadToStorage(ctx context.Context, storageID string, in io.Reader
 	}
 
 	if size > 0 && size > chunkSize {
+		fs.Debugf(f, "uploadToStorage: URN=%q size=%d using multipart (chunkSize=%d)", storageID, size, chunkSize)
 		return f.uploadMultipart(ctx, bucketKey, objectKey, in, size, chunkSize)
 	}
+	fs.Debugf(f, "uploadToStorage: URN=%q size=%d using single part", storageID, size)
 	return f.uploadSinglePart(ctx, bucketKey, objectKey, in, size)
 }
 
@@ -341,6 +347,7 @@ func (f *Fs) uploadMultipart(ctx context.Context, bucketKey, objectKey string, i
 		}
 		remaining -= partSize
 
+		fs.Infof(f, "uploadMultipart: uploading part %d/%d size=%d", i+1, numParts, partSize)
 		partReader := io.LimitReader(in, partSize)
 
 		uploadReq, err := http.NewRequestWithContext(ctx, http.MethodPut, signedResult.URLs[i], partReader)
@@ -400,6 +407,7 @@ func (f *Fs) uploadMultipart(ctx context.Context, bucketKey, objectKey string, i
 
 // createFirstVersion creates the first version of an item (new file).
 func (f *Fs) createFirstVersion(ctx context.Context, projectDM, folderDM, filename, storageID string) (string, error) {
+	fs.Debugf(f, "createFirstVersion: project=%q folder=%q filename=%q", projectDM, folderDM, filename)
 	payload := map[string]any{
 		"jsonapi": map[string]string{"version": "1.0"},
 		"data": map[string]any{
@@ -490,6 +498,7 @@ func (f *Fs) createFirstVersion(ctx context.Context, projectDM, folderDM, filena
 
 // createNextVersion creates a subsequent version of an existing item.
 func (f *Fs) createNextVersion(ctx context.Context, projectDM, itemDM, filename, storageID string) error {
+	fs.Debugf(f, "createNextVersion: project=%q item=%q filename=%q", projectDM, itemDM, filename)
 	payload := map[string]any{
 		"jsonapi": map[string]string{"version": "1.0"},
 		"data": map[string]any{
@@ -547,6 +556,7 @@ func (f *Fs) createNextVersion(ctx context.Context, projectDM, itemDM, filename,
 // getTopFolders returns the top-level folders for a project via the DM REST API.
 // Each returned entry has its DM API folder ID.
 func (f *Fs) getTopFolders(ctx context.Context, hubDM, projectDM string) ([]dmEntry, error) {
+	fs.Debugf(f, "getTopFolders: hub=%q project=%q", hubDM, projectDM)
 	url := fmt.Sprintf("%s/project/v1/hubs/%s/projects/%s/topFolders", dmBaseURL, hubDM, projectDM)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -584,11 +594,13 @@ func (f *Fs) getTopFolders(ctx context.Context, hubDM, projectDM string) ([]dmEn
 	for i, d := range result.Data {
 		folders[i] = dmEntry{ID: d.ID, Name: d.Attributes.Name}
 	}
+	fs.Debugf(f, "getTopFolders: project=%q found %d folders", projectDM, len(folders))
 	return folders, nil
 }
 
 // getFolderContents returns all entries (folders and items) inside a folder via the DM REST API.
 func (f *Fs) getFolderContents(ctx context.Context, projectDM, folderDM string) ([]dmEntry, error) {
+	fs.Debugf(f, "getFolderContents: project=%q folder=%q", projectDM, folderDM)
 	reqURL := fmt.Sprintf("%s%s/projects/%s/folders/%s/contents", dmBaseURL, dmDataPath, projectDM, folderDM)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
@@ -636,6 +648,7 @@ func (f *Fs) getFolderContents(ctx context.Context, projectDM, folderDM string) 
 			Name: name,
 		})
 	}
+	fs.Debugf(f, "getFolderContents: folder=%q found %d entries", folderDM, len(entries))
 	return entries, nil
 }
 
@@ -667,6 +680,7 @@ func (f *Fs) resolveItemDM(ctx context.Context, projectDM, folderDM, itemName st
 // so folderNames[0] is a user-visible folder that lives INSIDE one of the top
 // folders, not a top folder itself.
 func (f *Fs) resolveFolderDMPath(ctx context.Context, hubDM, projectDM string, folderNames []string) (string, error) {
+	fs.Debugf(f, "resolveFolderDMPath: walking path %v in project=%q", folderNames, projectDM)
 	if len(folderNames) == 0 {
 		return "", nil
 	}
@@ -708,6 +722,7 @@ func (f *Fs) resolveFolderDMPath(ctx context.Context, hubDM, projectDM string, f
 	if currentDM == "" {
 		return "", fmt.Errorf("folder %q not found via DM API", folderNames[0])
 	}
+	fs.Debugf(f, "resolveFolderDMPath: resolved %q -> %q", folderNames[0], currentDM)
 
 	// Walk deeper folders.
 	for i := 1; i < len(folderNames); i++ {
@@ -720,6 +735,7 @@ func (f *Fs) resolveFolderDMPath(ctx context.Context, hubDM, projectDM string, f
 			if sf.Type == "folders" && sf.Name == folderNames[i] {
 				currentDM = sf.ID
 				found = true
+				fs.Debugf(f, "resolveFolderDMPath: resolved %q -> %q", folderNames[i], currentDM)
 				break
 			}
 		}
@@ -734,6 +750,7 @@ func (f *Fs) resolveFolderDMPath(ctx context.Context, hubDM, projectDM string, f
 // getDownloadURLWithProject gets a signed download URL for an item within a project.
 // Uses the tip version's storage URN to get a signed S3 download URL.
 func (f *Fs) getDownloadURLWithProject(ctx context.Context, projectDM, itemDM string) (string, error) {
+	fs.Debugf(f, "getDownloadURLWithProject: project=%q item=%q", projectDM, itemDM)
 	// Step 1: Get the tip version to find the storage URN.
 	tipURL := fmt.Sprintf("%s%s/projects/%s/items/%s/tip", dmBaseURL, dmDataPath, projectDM, itemDM)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tipURL, nil)
@@ -821,6 +838,7 @@ func (f *Fs) getDownloadURLWithProject(ctx context.Context, projectDM, itemDM st
 
 // createFolder creates a new folder under the given parent.
 func (f *Fs) createFolder(ctx context.Context, projectDM, parentFolderDM, name string) (string, error) {
+	fs.Debugf(f, "createFolder: project=%q parent=%q name=%q", projectDM, parentFolderDM, name)
 	payload := map[string]any{
 		"jsonapi": map[string]string{"version": "1.0"},
 		"data": map[string]any{

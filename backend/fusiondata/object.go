@@ -66,6 +66,7 @@ func (o *Object) MimeType(ctx context.Context) string {
 
 // Open opens the object for reading. It downloads the file via a signed S3 URL.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	fs.Debugf(o, "Open: downloading %q (id=%q)", o.name, o.id)
 	// Resolve the full path to get project context.
 	fullPath := o.fs.root
 	if o.remote != "" {
@@ -99,6 +100,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if err != nil {
 		return nil, fmt.Errorf("resolving item DM for download: %w", err)
 	}
+	fs.Debugf(o, "Open: resolved DM IDs project=%q folder=%q item=%q", resolved.projectDM, folderDM, itemDM)
 
 	downloadURL, err := o.fs.getDownloadURLWithProject(ctx, resolved.projectDM, itemDM)
 	if err != nil {
@@ -132,6 +134,8 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return nil, fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
 	}
 
+	fs.Infof(o, "Open: download started for %q size=%d", o.name, o.size)
+
 	// Capture ETag from S3 response.
 	if etag := resp.Header.Get("ETag"); etag != "" {
 		o.etag = etag
@@ -142,6 +146,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 // Update replaces the content of this object (creates a new version in Fusion Data).
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	fs.Debugf(o, "Update: updating %q size=%d", o.name, src.Size())
 	// Resolve path to get project DM ID and item DM ID.
 	fullPath := o.fs.root
 	if o.remote != "" {
@@ -193,6 +198,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return fmt.Errorf("creating new version: %w", err)
 	}
 
+	fs.Infof(o, "Update: new version created for %q", o.name)
 	o.size = src.Size()
 	o.modTime = time.Now()
 
