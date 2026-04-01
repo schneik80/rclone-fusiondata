@@ -664,8 +664,12 @@ func (f *Fs) resolveItemDM(ctx context.Context, projectDM, folderDM, itemName st
 	if err != nil {
 		return "", err
 	}
+	// Try exact match first, then match with fusion extension stripped.
+	// The display name may have a fusion extension (e.g. "Part.fusiondesign")
+	// but the DM API returns the server-side name (e.g. "Part").
+	stripped := stripFusionExtension(itemName)
 	for _, e := range entries {
-		if e.Type == "items" && e.Name == itemName {
+		if e.Type == "items" && (e.Name == itemName || e.Name == stripped) {
 			return e.ID, nil
 		}
 	}

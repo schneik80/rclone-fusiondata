@@ -548,7 +548,7 @@ func GetItemDetails(ctx context.Context, client *http.Client, hubID, itemID stri
 
 	details := &ItemDetails{
 		ID:            raw.Item.ID,
-		Name:          raw.Item.Name,
+		Name:          applyFusionExtension(raw.Item.Name, raw.Item.Typename),
 		Typename:      raw.Item.Typename,
 		Size:          raw.Item.Size,
 		MimeType:      raw.Item.MimeType,
@@ -568,6 +568,39 @@ func GetItemDetails(ctx context.Context, client *http.Client, hubID, itemID stri
 // Helpers
 // ---------------------------------------------------------------------------
 
+// fusionExtensions maps GraphQL typenames to Fusion-specific file extensions.
+var fusionExtensions = map[string]string{
+	"DesignItem":             ".fusiondesign",
+	"ConfiguredDesignItem":   ".fusionconfig",
+	"DrawingItem":            ".fusiondrawing",
+	"DrawingTemplateItem":    ".drawingtemplate",
+}
+
+// applyFusionExtension appends the appropriate Fusion extension to a filename
+// if the item is a Fusion type and doesn't already have the extension.
+func applyFusionExtension(name, typename string) string {
+	ext, ok := fusionExtensions[typename]
+	if !ok {
+		return name // not a Fusion type — leave as-is
+	}
+	if strings.HasSuffix(strings.ToLower(name), ext) {
+		return name // already has the extension
+	}
+	return name + ext
+}
+
+// stripFusionExtension removes a Fusion extension from a filename if present.
+// Used when matching display names back to server-side names.
+func stripFusionExtension(name string) string {
+	lower := strings.ToLower(name)
+	for _, ext := range fusionExtensions {
+		if strings.HasSuffix(lower, ext) {
+			return name[:len(name)-len(ext)]
+		}
+	}
+	return name
+}
+
 func navItemFromTypename(id, name, typename string) NavItem {
 	kind := "unknown"
 	isContainer := false
@@ -578,11 +611,17 @@ func navItemFromTypename(id, name, typename string) NavItem {
 		kind = "configured"
 	case "DrawingItem":
 		kind = "drawing"
+	case "DrawingTemplateItem":
+		kind = "drawingtemplate"
 	case "Folder":
 		kind = "folder"
 		isContainer = true
 	case "BasicItem":
 		kind = "basic"
+	}
+	// Apply Fusion file extension for non-container items.
+	if !isContainer {
+		name = applyFusionExtension(name, typename)
 	}
 	return NavItem{ID: id, Name: name, Kind: kind, IsContainer: isContainer}
 }
